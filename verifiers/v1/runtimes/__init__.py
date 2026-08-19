@@ -12,6 +12,11 @@ from verifiers.v1.runtimes.base import (
     RuntimeProcess,
     register,
 )
+from verifiers.v1.runtimes.agentenv import (
+    AgentEnvConfig,
+    AgentEnvRuntime,
+    AgentEnvRuntimeInfo,
+)
 from verifiers.v1.runtimes.docker import DockerConfig, DockerRuntime, DockerRuntimeInfo
 from verifiers.v1.runtimes.modal import ModalConfig, ModalRuntime, ModalRuntimeInfo
 from verifiers.v1.runtimes.prime import (
@@ -27,12 +32,16 @@ from verifiers.v1.runtimes.subprocess import (
 )
 
 RuntimeConfig = Annotated[
-    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig,
+    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig | AgentEnvConfig,
     Field(discriminator="type"),
 ]
 
 RuntimeInfo = Annotated[
-    SubprocessRuntimeInfo | DockerRuntimeInfo | PrimeRuntimeInfo | ModalRuntimeInfo,
+    SubprocessRuntimeInfo
+    | DockerRuntimeInfo
+    | PrimeRuntimeInfo
+    | ModalRuntimeInfo
+    | AgentEnvRuntimeInfo,
     Field(discriminator="type"),
 ]
 
@@ -44,6 +53,8 @@ def _runtime_cls(config: RuntimeConfig) -> type[Runtime]:
         return ModalRuntime
     if isinstance(config, DockerConfig):
         return DockerRuntime
+    if isinstance(config, AgentEnvConfig):
+        return AgentEnvRuntime
     return SubprocessRuntime
 
 
@@ -79,6 +90,9 @@ def runtime_is_local(config: RuntimeConfig) -> bool:
 
 
 __all__ = [
+    "AgentEnvConfig",
+    "AgentEnvRuntime",
+    "AgentEnvRuntimeInfo",
     "BaseRuntimeInfo",
     "DockerConfig",
     "DockerRuntime",
