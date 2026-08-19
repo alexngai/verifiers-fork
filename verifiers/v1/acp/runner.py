@@ -161,6 +161,11 @@ async def prompt(
     return client.visible_reply
 
 
+def request_error_detail(error: RequestError) -> str:
+    detail = error.data.get("details") if isinstance(error.data, dict) else None
+    return detail or f"{error} data={error.data!r}"
+
+
 class ACPSession:
     """One live ACP process, connection, and session shared by several turns."""
 
@@ -268,6 +273,8 @@ class ACPSession:
                     **kwargs,
                 )
                 next_session_id = response.session_id
+        except RequestError as error:
+            raise RuntimeError(request_error_detail(error)) from error
         except BaseException:
             with suppress(BaseException):
                 await self.stack.aclose()
