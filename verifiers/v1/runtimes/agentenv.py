@@ -350,7 +350,11 @@ class AgentEnvRuntime(Runtime):
             except SandboxError:
                 raise
             except Exception as e:  # provisioning failure is one rollout's problem, not the eval's
-                raise SandboxError(f"agentenv sandbox provisioning failed: {e}") from e
+                logger.warning("agentenv: provisioning failed for template=%s: %s: %r",
+                               self._template_name(), type(e).__name__, e)
+                raise SandboxError(
+                    f"agentenv sandbox provisioning failed: {type(e).__name__}: {e}"
+                ) from e
         except BaseException:  # incl. CancelledError — never leak the slot if we never run()
             self._release_setup_gate()
             raise
