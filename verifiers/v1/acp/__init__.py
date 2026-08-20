@@ -29,6 +29,7 @@ JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
 JsonObject: TypeAlias = dict[str, JsonValue]
+SNAPSHOT_ENV_KEYS = frozenset({"CODEX_HOME", "CLAUDE_CONFIG_DIR"})
 
 
 @dataclass
@@ -39,8 +40,16 @@ class ACPConfig:
     command: list[str]
     prompt: str | Messages | None
     mcp_urls: dict[str, str] | None = None
+    cwd: str | None = None
+    additional_directories: list[str] | None = None
     system_prompt: str | None = None
     session_meta: JsonObject | None = None
+    allow_empty_tool_reply: bool = False
+
+
+def _snapshot_env(env: dict[str, str]) -> dict[str, str]:
+    """Non-secret env values needed to keep adapter state dirs stable across forks."""
+    return {key: value for key, value in env.items() if key in SNAPSHOT_ENV_KEYS}
 
 
 class ACPHarness(Harness[ConfigT]):
@@ -107,6 +116,57 @@ class ACPHarness(Harness[ConfigT]):
             f"harness {self.config.id!r} requires a rollout-scoped session"
         )
 
+    async def adopt_or_resume(
+        self,
+        ctx: ModelContext,
+        trace: Trace,
+        runtime: Runtime,
+        endpoint: str,
+        secret: str,
+        mcp_urls: dict[str, str],
+        data: TaskData,
+        snapshot: JsonObject,
+        *,
+        operation: str = "auto",
+    ) -> "ACPHarnessSession":
+        """Create a rollout-scoped ACP session from a prior session snapshot.
+
+        The runtime is expected to already represent the child sandbox/VM state.
+        This method reconstructs the host-side ACP runner and asks the adapter to
+        resume, load, or fork the native session id captured at the branch point.
+        """
+        if not runtime.supports_live_processes:
+            raise HarnessError(
+                f"harness {self.config.id!r} requires a runtime with live process support"
+            )
+        config = await self.prepare_acp(
+            ctx, trace, runtime, endpoint, secret, mcp_urls, data
+        )
+        snapshot_config = snapshot.get("config")
+        if isinstance(snapshot_config, dict):
+            env = snapshot_config.get("env")
+            if isinstance(env, dict):
+                config.env.update(
+                    {
+                        str(key): str(value)
+                        for key, value in env.items()
+                        if key in SNAPSHOT_ENV_KEYS
+                    }
+                )
+        session = ACPHarnessSession(
+            self,
+            ctx,
+            trace,
+            runtime,
+            endpoint,
+            secret,
+            mcp_urls if config.mcp_urls is None else config.mcp_urls,
+            data,
+            config,
+        )
+        await session.resume_from_snapshot(snapshot, operation=operation)
+        return session
+
 
 def _packet(value: JsonObject) -> bytes:
     data = json.dumps(value, ensure_ascii=False).encode()
@@ -171,6 +231,70 @@ class ACPHarnessSession(HarnessSession):
         self._stderr_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
 
+    def _prompt_config(self, messages: Messages | None) -> JsonObject:
+        prompt = self.config.prompt if messages is None else messages
+        if prompt is None:
+            raise ValueError("ACP requires a prompt")
+        if not isinstance(prompt, str) and (
+            not prompt or any(message.role != "user" for message in prompt)
+        ):
+            raise ValueError("an ACP turn must contain user messages only")
+        user_contents = (
+            [prompt]
+            if isinstance(prompt, str)
+            else [
+                message.model_dump(mode="json", include={"content"})["content"]
+                for message in prompt
+            ]
+        )
+        return self._control_config(user_contents=user_contents)
+
+    def _control_config(
+        self,
+        *,
+        user_contents: list[JsonValue] | None = None,
+        runner_snapshot: JsonObject | None = None,
+    ) -> JsonObject:
+        runner_snapshot = runner_snapshot or {}
+        return {
+            "command": self.config.command,
+            "user_contents": user_contents or [],
+            "mcp_urls": self.mcp_urls,
+            "cwd": runner_snapshot.get("cwd") or self.config.cwd,
+            "additional_directories": (
+                runner_snapshot.get("additional_directories")
+                or self.config.additional_directories
+            ),
+            "system_prompt": self.config.system_prompt or "",
+            "session_meta": self.config.session_meta or {},
+            "allow_empty_tool_reply": self.config.allow_empty_tool_reply,
+        }
+
+    @staticmethod
+    def _runner_snapshot(snapshot: JsonObject) -> JsonObject:
+        runner = snapshot.get("runner", snapshot)
+        if not isinstance(runner, dict):
+            raise TypeError("ACP session snapshot must contain a runner object")
+        return runner
+
+    @staticmethod
+    def _choose_resume_operation(runner_snapshot: JsonObject, operation: str) -> str:
+        if operation != "auto":
+            if operation not in ("resume_session", "load_session", "fork_session"):
+                raise ValueError(f"unknown ACP resume operation: {operation!r}")
+            return operation
+        capabilities = runner_snapshot.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return "resume_session"
+        session = capabilities.get("session")
+        if isinstance(session, dict) and session.get("fork"):
+            return "fork_session"
+        if isinstance(session, dict) and session.get("resume"):
+            return "resume_session"
+        if capabilities.get("load_session"):
+            return "load_session"
+        return "resume_session"
+
     async def _start(self) -> None:
         self._stderr_tail.clear()
         program = await self.runtime.prepare_uv_script(
@@ -192,29 +316,7 @@ class ACPHarnessSession(HarnessSession):
     def _stderr(self) -> str:
         return self._stderr_tail.decode(errors="replace").strip()
 
-    async def _run(self, messages: Messages | None) -> ProgramResult:
-        prompt = self.config.prompt if messages is None else messages
-        if prompt is None:
-            raise ValueError("ACP requires a prompt")
-        if not isinstance(prompt, str) and (
-            not prompt or any(message.role != "user" for message in prompt)
-        ):
-            raise ValueError("an ACP turn must contain user messages only")
-        user_contents = (
-            [prompt]
-            if isinstance(prompt, str)
-            else [
-                message.model_dump(mode="json", include={"content"})["content"]
-                for message in prompt
-            ]
-        )
-        config = {
-            "command": self.config.command,
-            "user_contents": user_contents,
-            "mcp_urls": self.mcp_urls,
-            "system_prompt": self.config.system_prompt or "",
-            "session_meta": self.config.session_meta or {},
-        }
+    async def _request(self, request: JsonObject) -> JsonObject:
         async with self._lock:
             if self._closed:
                 raise HarnessError(
@@ -224,11 +326,8 @@ class ACPHarnessSession(HarnessSession):
                 await self._start()
             assert self._process is not None
             assert self._reader is not None
-            calls_before = len(self.trace.calls)
             try:
-                await self._process.write(
-                    _packet({"operation": "prompt", "config": config})
-                )
+                await self._process.write(_packet(request))
                 response = await self._reader.read()
             except BaseException:
                 await run_shielded(self._stop(graceful=False))
@@ -238,6 +337,60 @@ class ACPHarnessSession(HarnessSession):
             if stderr := self._stderr():
                 detail = f"{detail}\n\nACP process stderr:\n{stderr}"
             raise RuntimeError(detail)
+        return response
+
+    async def snapshot(self) -> JsonObject:
+        response = await self._request({"operation": "snapshot"})
+        runner = response.get("snapshot")
+        if not isinstance(runner, dict):
+            raise TypeError("ACP snapshot response must contain a snapshot object")
+        return {
+            "schema_version": "verifiers.acp_session.v1",
+            "harness_id": self.harness.config.id,
+            "trace_id": self.trace.id,
+            "runner": runner,
+            "config": {
+                "command": self.config.command,
+                "env": _snapshot_env(self.config.env),
+                "mcp_urls": self.mcp_urls,
+                "cwd": runner.get("cwd") or self.config.cwd,
+                "additional_directories": (
+                    runner.get("additional_directories")
+                    or self.config.additional_directories
+                ),
+                "system_prompt": self.config.system_prompt or "",
+                "session_meta": self.config.session_meta or {},
+                "allow_empty_tool_reply": self.config.allow_empty_tool_reply,
+            },
+        }
+
+    async def resume_from_snapshot(
+        self,
+        snapshot: JsonObject,
+        *,
+        operation: str = "auto",
+    ) -> JsonObject:
+        runner = self._runner_snapshot(snapshot)
+        session_id = runner.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("ACP session snapshot is missing session_id")
+        chosen = self._choose_resume_operation(runner, operation)
+        response = await self._request(
+            {
+                "operation": chosen,
+                "session_id": session_id,
+                "config": self._control_config(runner_snapshot=runner),
+            }
+        )
+        resumed = response.get("snapshot")
+        if not isinstance(resumed, dict):
+            raise TypeError("ACP resume response must contain a snapshot object")
+        return resumed
+
+    async def _run(self, messages: Messages | None) -> ProgramResult:
+        config = self._prompt_config(messages)
+        calls_before = len(self.trace.calls)
+        response = await self._request({"operation": "prompt", "config": config})
         reply = response.get("reply", "")
         if not isinstance(reply, str):
             raise TypeError("ACP session reply must be a string")

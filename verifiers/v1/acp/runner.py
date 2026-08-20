@@ -105,8 +105,34 @@ def user_content_blocks(contents: list, supports_images: bool) -> list:
 def mcp_servers(config: dict) -> list[HttpMcpServer]:
     return [
         HttpMcpServer(type="http", name=name, url=url, headers=[])
-        for name, url in config["mcp_urls"].items()
+        for name, url in config.get("mcp_urls", {}).items()
     ]
+
+
+def capability_summary(capabilities: Any) -> dict[str, Any]:
+    prompt_capabilities = capabilities and capabilities.prompt_capabilities
+    session_capabilities = capabilities and capabilities.session_capabilities
+    return {
+        "load_session": bool(capabilities and capabilities.load_session),
+        "prompt": {
+            "image": bool(prompt_capabilities and prompt_capabilities.image),
+            "audio": bool(prompt_capabilities and prompt_capabilities.audio),
+            "embedded_context": bool(
+                prompt_capabilities and prompt_capabilities.embedded_context
+            ),
+        },
+        "session": {
+            "resume": bool(session_capabilities and session_capabilities.resume is not None),
+            "fork": bool(session_capabilities and session_capabilities.fork is not None),
+            "list": bool(session_capabilities and session_capabilities.list is not None),
+            "close": bool(session_capabilities and session_capabilities.close is not None),
+            "delete": bool(session_capabilities and session_capabilities.delete is not None),
+            "additional_directories": bool(
+                session_capabilities
+                and session_capabilities.additional_directories is not None
+            ),
+        },
+    }
 
 
 async def prompt(
@@ -135,6 +161,11 @@ async def prompt(
     return client.visible_reply
 
 
+def request_error_detail(error: RequestError) -> str:
+    detail = error.data.get("details") if isinstance(error.data, dict) else None
+    return detail or f"{error} data={error.data!r}"
+
+
 class ACPSession:
     """One live ACP process, connection, and session shared by several turns."""
 
@@ -147,9 +178,15 @@ class ACPSession:
         self.connection: Any = None
         self.capabilities: Any = None
         self.session_id: str | None = None
+        self.cwd: str | None = None
+        self.mcp_urls: dict[str, str] = {}
+        self.additional_directories: list[str] | None = None
+        self.session_meta: dict[str, Any] = {}
         self.is_new = True
 
-    async def start(self, config: dict) -> None:
+    async def _ensure_agent(self, config: dict) -> None:
+        if self.connection is not None:
+            return
         command = config["command"]
         try:
             agent_process = await self.stack.enter_async_context(
@@ -167,10 +204,33 @@ class ACPSession:
                 client_capabilities=ClientCapabilities(),
             )
             self.capabilities = initialized.agent_capabilities
+        except BaseException:
+            with suppress(BaseException):
+                await self.stack.aclose()
+            self._reset()
+            raise
+
+    def _session_kwargs(self, config: dict) -> dict[str, Any]:
+        return {
+            "cwd": config.get("cwd") or os.getcwd(),
+            "additional_directories": config.get("additional_directories"),
+            "mcp_servers": mcp_servers(config),
+            **config.get("session_meta", {}),
+        }
+
+    def _remember_session_config(self, config: dict, kwargs: dict[str, Any]) -> None:
+        self.cwd = kwargs["cwd"]
+        self.mcp_urls = dict(config.get("mcp_urls", {}))
+        self.additional_directories = kwargs.get("additional_directories")
+        self.session_meta = dict(config.get("session_meta", {}))
+
+    async def start(self, config: dict) -> None:
+        try:
+            await self._ensure_agent(config)
+            kwargs = self._session_kwargs(config)
+            assert self.connection is not None
             session = await self.connection.new_session(
-                cwd=os.getcwd(),
-                mcp_servers=mcp_servers(config),
-                **config["session_meta"],
+                **kwargs,
             )
         except BaseException:
             with suppress(BaseException):
@@ -178,7 +238,65 @@ class ACPSession:
             self._reset()
             raise
         self.session_id = session.session_id
+        self._remember_session_config(config, kwargs)
         self.is_new = True
+
+    async def resume(self, config: dict, session_id: str, *, operation: str) -> dict[str, Any]:
+        if operation not in ("resume_session", "load_session", "fork_session"):
+            raise ValueError(f"unsupported ACP resume operation: {operation!r}")
+        if self.connection is not None and self.session_id is not None:
+            raise RuntimeError("ACP session is already open")
+        try:
+            await self._ensure_agent(config)
+            kwargs = self._session_kwargs(config)
+            assert self.connection is not None
+            if operation == "resume_session":
+                response = await self.connection.resume_session(
+                    session_id=session_id,
+                    **kwargs,
+                )
+                next_session_id = session_id
+            elif operation == "load_session":
+                response = await self.connection.load_session(
+                    session_id=session_id,
+                    **kwargs,
+                )
+                next_session_id = session_id
+            else:
+                session_capabilities = (
+                    self.capabilities and self.capabilities.session_capabilities
+                )
+                if not (session_capabilities and session_capabilities.fork is not None):
+                    raise RuntimeError("ACP agent does not advertise session fork support")
+                response = await self.connection.fork_session(
+                    session_id=session_id,
+                    **kwargs,
+                )
+                next_session_id = response.session_id
+        except RequestError as error:
+            raise RuntimeError(request_error_detail(error)) from error
+        except BaseException:
+            with suppress(BaseException):
+                await self.stack.aclose()
+            self._reset()
+            raise
+        self.session_id = next_session_id
+        self._remember_session_config(config, kwargs)
+        self.is_new = False
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        if self.session_id is None:
+            raise RuntimeError("ACP session is not open")
+        return {
+            "session_id": self.session_id,
+            "cwd": self.cwd or os.getcwd(),
+            "mcp_urls": self.mcp_urls,
+            "additional_directories": self.additional_directories,
+            "session_meta": self.session_meta,
+            "is_new": self.is_new,
+            "capabilities": capability_summary(self.capabilities),
+        }
 
     async def run(self, config: dict) -> str:
         if self.connection is None:
@@ -250,6 +368,17 @@ async def serve_stream() -> None:
                     response = {
                         "ok": True,
                         "reply": await session.run(request["config"]),
+                    }
+                elif operation == "snapshot":
+                    response = {"ok": True, "snapshot": session.snapshot()}
+                elif operation == "resume_session" or operation == "load_session" or operation == "fork_session":
+                    response = {
+                        "ok": True,
+                        "snapshot": await session.resume(
+                            request["config"],
+                            request["session_id"],
+                            operation=operation,
+                        ),
                     }
                 elif operation == "shutdown":
                     await session.close()
