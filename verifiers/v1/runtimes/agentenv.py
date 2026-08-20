@@ -78,6 +78,15 @@ class AgentEnvConfig(BaseConfig):
     deadline bounds episodes at a higher level); avoids e2b's short default cutting off long steps."""
     sandbox_timeout: int = 24 * 60 * 60
     """Sandbox lifetime (dead-man backstop). Matches Modal's max-lifetime."""
+    create_timeout: float = float(os.environ.get("CHORUS_AGENTENV_CREATE_TIMEOUT_S", "180"))
+    """Bound (s) on sandbox create/fork in start(). A create that hangs past this ERRORS the rollout
+    (-> orchestrator retries) instead of wedging its setup-gate slot forever. 0 disables."""
+    setup_timeout: float = float(os.environ.get("CHORUS_AGENTENV_SETUP_TIMEOUT_S", "300"))
+    """Bound (s) on the FIRST run() — the cold uv-sync harness bootstrap. THE fix for the inflight=32
+    setup-hang (2026-08-19): 32 rollouts hung in the bootstrap with GPUs idle because the agent
+    rollout timeout EXCLUDES setup, so a stuck bootstrap never resolved and its setup-gate slot never
+    released -> the whole batch wedged. Bounding ONLY the first run (later agent commands keep
+    exec_timeout) turns a hung bootstrap into a retryable error. 0 disables."""
     fork: bool | None = None
     """Fork acquisition. None -> CHORUS_SANDBOX_FORK env (default OFF). When on, one base per template
     is built+snapshotted and every rollout forks a child (~0.3s). Throughput only — see module docs."""
@@ -331,12 +340,20 @@ class AgentEnvRuntime(Runtime):
                 raise SandboxError("AgentEnvRuntime requires the `e2b` SDK") from e
             try:
                 conn = self._conn()
-                # Fork acquisition (throughput): try a warm fork; None -> cold create. When fork is
-                # off this is skipped entirely and the path is byte-identical to a plain create.
-                if self._fork_enabled:
-                    self._sandbox = await self._acquire_via_fork(conn)
-                if self._sandbox is None:
-                    self._sandbox = await self._cold_create(conn)
+
+                async def _provision() -> None:
+                    # Fork acquisition (throughput): try a warm fork; None -> cold create. When fork
+                    # is off this is skipped and the path is byte-identical to a plain create.
+                    if self._fork_enabled:
+                        self._sandbox = await self._acquire_via_fork(conn)
+                    if self._sandbox is None:
+                        self._sandbox = await self._cold_create(conn)
+
+                ct = self.config.create_timeout
+                if ct and ct > 0:
+                    await asyncio.wait_for(_provision(), timeout=ct)
+                else:
+                    await _provision()
                 self.info.id = self._sandbox.sandbox_id
                 logger.info(
                     "agentenv: sandbox %s up (template=%s, fork=%s)",
@@ -378,6 +395,10 @@ class AgentEnvRuntime(Runtime):
         # on stock cloud e2b and the self-hosted aenv plane. The trailing `exit` preserves the inner
         # command's exit code, so a non-zero exit still surfaces as CommandExitException as before.
         self._exec_seq += 1
+        # The FIRST run() while still holding the setup gate IS the cold uv-sync harness bootstrap —
+        # bound it (setup_timeout) so a hung bootstrap errors instead of freezing the batch. Later
+        # (agent) commands keep exec_timeout. Captured before the finally releases the gate.
+        is_setup = self._holds_setup_gate
         base = f"/tmp/.chorus-exec.{self._exec_seq}"
         out_q = shlex.quote(f"{base}.out")
         err_q = shlex.quote(f"{base}.err")
@@ -390,7 +411,7 @@ class AgentEnvRuntime(Runtime):
             f"__chorus_rc=$?; cat {out_q}; cat {err_q} >&2; exit $__chorus_rc"
         )
         try:
-            result = await self._sandbox.commands.run(
+            _cmd = self._sandbox.commands.run(
                 wrapped,
                 # `env or {}` (not process_env): matches the proven shipping behavior and takes no
                 # dependency on a base method that may be absent in an older pinned verifiers when
@@ -401,6 +422,13 @@ class AgentEnvRuntime(Runtime):
                 cwd=self.config.workdir or None,
                 timeout=self.config.exec_timeout,
             )
+            _st = self.config.setup_timeout
+            if is_setup and _st and _st > 0:
+                # asyncio.wait_for cancels the underlying commands.run on timeout; the SandboxError
+                # below then surfaces it as a retryable rollout failure (the finally frees the gate).
+                result = await asyncio.wait_for(_cmd, timeout=_st)
+            else:
+                result = await _cmd
             return ProgramResult(
                 exit_code=int(result.exit_code),
                 stdout=result.stdout or "",
