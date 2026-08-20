@@ -371,25 +371,7 @@ async def serve_stream() -> None:
                     }
                 elif operation == "snapshot":
                     response = {"ok": True, "snapshot": session.snapshot()}
-                elif operation == "resume_session":
-                    response = {
-                        "ok": True,
-                        "snapshot": await session.resume(
-                            request["config"],
-                            request["session_id"],
-                            operation=operation,
-                        ),
-                    }
-                elif operation == "load_session":
-                    response = {
-                        "ok": True,
-                        "snapshot": await session.resume(
-                            request["config"],
-                            request["session_id"],
-                            operation=operation,
-                        ),
-                    }
-                elif operation == "fork_session":
+                elif operation == "resume_session" or operation == "load_session" or operation == "fork_session":
                     response = {
                         "ok": True,
                         "snapshot": await session.resume(

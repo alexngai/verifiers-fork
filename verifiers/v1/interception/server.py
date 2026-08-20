@@ -27,7 +27,7 @@ import logging
 import secrets
 import time
 import traceback
-from collections.abc import AsyncIterator, Collection, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Mapping
 from contextlib import asynccontextmanager
 from tempfile import SpooledTemporaryFile
 from typing import Literal
@@ -109,6 +109,155 @@ def _completion_response(completion: dict | None) -> web.Response:
     except PydanticSerializationError:
         return web.json_response(completion)
     return web.Response(body=body, content_type="application/json", charset="utf-8")
+
+
+def _usage_openai(usage: Usage | None) -> dict | None:
+    if usage is None:
+        return None
+    payload: dict = {
+        "prompt_tokens": usage.input_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    if usage.cached_input_tokens is not None:
+        payload["prompt_tokens_details"] = {"cached_tokens": usage.cached_input_tokens}
+    if usage.reasoning_tokens is not None:
+        payload["completion_tokens_details"] = {
+            "reasoning_tokens": usage.reasoning_tokens
+        }
+    return payload
+
+
+def _usage_anthropic(usage: Usage | None) -> dict:
+    return {
+        "input_tokens": usage.input_tokens if usage is not None else 0,
+        "output_tokens": usage.completion_tokens if usage is not None else 0,
+    }
+
+
+def _usage_responses(usage: Usage | None) -> dict | None:
+    if usage is None:
+        return None
+    payload: dict = {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    if usage.cached_input_tokens is not None:
+        payload["input_tokens_details"] = {"cached_tokens": usage.cached_input_tokens}
+    if usage.reasoning_tokens is not None:
+        payload["output_tokens_details"] = {"reasoning_tokens": usage.reasoning_tokens}
+    return payload
+
+
+def _tool_arguments(arguments: str) -> object:
+    try:
+        return json.loads(arguments)
+    except ValueError:
+        return {"arguments": arguments}
+
+
+def _forced_raw_response(dialect: Dialect, body: dict, response: Response) -> dict:
+    """Native wire payload for a queued forced response.
+
+    Callers that need exact provider quirks can set ``Response.raw``. Otherwise this
+    builds the minimal shape each registered dialect can return to an SDK.
+    """
+    if response.raw is not None:
+        return response.raw
+    message = response.message
+    created = response.created or int(time.time())
+    model = response.model or str(body.get("model") or "")
+    finish_reason = response.finish_reason or (
+        "tool_calls" if message.tool_calls else "stop"
+    )
+    if dialect.upstream_path == "/v1/messages":
+        content = []
+        if message.content:
+            content.append({"type": "text", "text": message.content})
+        for call in message.tool_calls or []:
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": _tool_arguments(call.arguments),
+                }
+            )
+        return {
+            "id": response.id or "msg_forced",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content or [{"type": "text", "text": ""}],
+            "stop_reason": "tool_use" if message.tool_calls else "end_turn",
+            "stop_sequence": None,
+            "usage": _usage_anthropic(response.usage),
+        }
+    if dialect.upstream_path == "/responses":
+        output = []
+        if message.content or not message.tool_calls:
+            output.append(
+                {
+                    "type": "message",
+                    "id": response.id or "msg_forced",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": message.content or "",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            )
+        for call in message.tool_calls or []:
+            output.append(
+                {
+                    "type": "function_call",
+                    "id": call.id,
+                    "call_id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "status": "completed",
+                }
+            )
+        return {
+            "id": response.id or "resp_forced",
+            "object": "response",
+            "created_at": created,
+            "model": model,
+            "status": "completed",
+            "output": output,
+            "usage": _usage_responses(response.usage),
+        }
+    wire_message: dict = {"role": "assistant", "content": message.content}
+    if message.reasoning_content is not None:
+        wire_message["reasoning_content"] = message.reasoning_content
+    if message.tool_calls:
+        wire_message["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            }
+            for call in message.tool_calls
+        ]
+    return {
+        "id": response.id or "chatcmpl-forced",
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": wire_message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": _usage_openai(response.usage),
+    }
 
 
 async def _queue_chunks(
@@ -376,6 +525,109 @@ class InterceptionServer(Interception):
             )
         )
 
+    async def _serve_forced_response(
+        self,
+        session: RolloutSession,
+        dialect: Dialect,
+        body: dict,
+        model_request: Request,
+        *,
+        turn: graph.PendingTurn,
+        response: Response,
+        streaming: bool,
+        req_hash: bytes | None,
+        finish_inflight: Callable[[dict | None], None],
+        policy_paths: list[str] | None = None,
+    ) -> web.StreamResponse:
+        """Commit and return a queued forced response without calling upstream."""
+        session.error = None
+        node: int | None = None
+        error: Exception | None = None
+        response_rewrites = []
+        started = time.time()
+        try:
+            try:
+                response.raw = _forced_raw_response(dialect, body, response)
+                if session.released:
+                    finish_inflight()
+                    return web.json_response(
+                        dialect.error_body("rollout concluded"), status=409
+                    )
+                stopped = None
+                if session.response_interceptors or session.response_stops:
+                    (
+                        response,
+                        response_rewrites,
+                        stopped,
+                    ) = await session.rewrite_response(response)
+                    if response_rewrites:
+                        response.raw = response.raw or _forced_raw_response(
+                            dialect, body, response
+                        )
+                        dialect.rewrite_response(
+                            response.raw, response.message.content or ""
+                        )
+                if session.stopped:
+                    finish_inflight()
+                    return web.json_response(
+                        dialect.error_body(
+                            f"rollout stopped: {session.trace.stop_condition}"
+                        ),
+                        status=400,
+                    )
+                response.raw = response.raw or _forced_raw_response(dialect, body, response)
+                node = turn.commit(response, model_request.tools)
+                session.consume_prepared(turn.tail)
+                session.trace.response_rewrites.extend(response_rewrites)
+                if stopped is not None:
+                    session.trace.stop(stopped)
+                    finish_inflight()
+                    return web.json_response(
+                        dialect.error_body(f"rollout stopped: {stopped}"),
+                        status=400,
+                    )
+            except RolloutError as e:
+                error = e
+                session.error = e
+                finish_inflight()
+                return web.json_response(
+                    dialect.error_body(str(e)),
+                    status=getattr(e, "status_code", 502),
+                )
+            except Exception as e:  # noqa: BLE001 - surface as an API error
+                error = e
+                finish_inflight()
+                logger.warning(
+                    "forced model response failed: id=%s %s: %s",
+                    session.trace.id,
+                    type(e).__name__,
+                    e,
+                )
+                return web.json_response(dialect.error_body(str(e)), status=502)
+        finally:
+            self.record_call(
+                session,
+                dialect,
+                body,
+                started,
+                node=node,
+                finish_reason=response.finish_reason if response else None,
+                usage=response.usage if response else None,
+                error=error,
+                policy_paths=policy_paths,
+            )
+        assert response.raw is not None
+        if streaming:
+            return web.Response(
+                body=b"".join(dialect.stream_events(response.raw)),
+                content_type="text/event-stream",
+            )
+        if req_hash is not None:
+            session.last_request = req_hash
+            session.last_response = response.raw
+        finish_inflight(response.raw)
+        return _completion_response(response.raw)
+
     async def handle_request(
         self, request: web.Request, dialect: Dialect
     ) -> web.StreamResponse:
@@ -513,7 +765,31 @@ class InterceptionServer(Interception):
             finish_inflight()
             return self._fail(session, dialect, error)
 
+        try:
+            forced = session.consume_forced_response(model_request)
+        except RolloutError as error:
+            finish_inflight()
+            return self._fail(session, dialect, error)
+
         inspect_response = bool(session.response_interceptors or session.response_stops)
+        if forced is not None:
+            logger.debug(
+                "intercept forced turn: id=%s source=%s",
+                session.trace.id,
+                forced.source,
+            )
+            return await self._serve_forced_response(
+                session,
+                dialect,
+                body,
+                model_request,
+                turn=turn,
+                response=forced.response,
+                streaming=streaming,
+                req_hash=None if streaming else req_hash,
+                finish_inflight=finish_inflight,
+                policy_paths=policy_paths,
+            )
         if streaming:
             return await self._stream(
                 request,

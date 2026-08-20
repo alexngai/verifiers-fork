@@ -8,13 +8,16 @@ budget (turns / tokens), checked between turns.
 """
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
-from collections import Counter
+import time
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import get_origin, get_type_hints
+from typing import Any, get_origin, get_type_hints
 
 from pydantic import TypeAdapter
 
@@ -34,6 +37,18 @@ from verifiers.v1.types import (
 from verifiers.v1.utils.decorators import invoke
 
 logger = logging.getLogger(__name__)
+
+
+def request_fingerprint(request: Request) -> str:
+    """Stable digest of the typed prompt/tool payload at the model boundary."""
+    payload = request.model_dump(mode="json", exclude_none=True)
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def hook_boundary(handler: Callable, *, allow_trace: bool) -> type:
@@ -94,6 +109,16 @@ class RolloutLimits:
         return None
 
 
+@dataclass(frozen=True)
+class ForcedResponse:
+    """One queued assistant response to serve instead of sampling upstream."""
+
+    response: Response
+    prompt_fingerprint: str | None = None
+    source: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class RolloutSession:
     ctx: ModelContext
@@ -134,10 +159,86 @@ class RolloutSession:
     the exchange (upstream call, simulator turn) — unregistering cancels these instead."""
     prepared_tool_results: dict[str, ToolMessage] = field(default_factory=dict)
     prepared_users: Counter[str] = field(default_factory=Counter)
+    forced_responses: deque[ForcedResponse] = field(default_factory=deque)
 
     @property
     def stopped(self) -> bool:
         return self.trace.stop_condition is not None
+
+    def enqueue_forced_response(
+        self,
+        forced: ForcedResponse | Response | dict[str, Any],
+        *,
+        prompt_fingerprint: str | None = None,
+        source: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Queue a response for the next model request in this rollout.
+
+        This is intentionally one-shot: it lets a branch controller inject a
+        candidate assistant turn at a known prompt boundary, while all subsequent
+        model calls flow through the normal provider/client path.
+        """
+        if isinstance(forced, ForcedResponse):
+            item = forced
+        elif isinstance(forced, Response):
+            item = ForcedResponse(
+                response=forced,
+                prompt_fingerprint=prompt_fingerprint,
+                source=source,
+                metadata=dict(metadata or {}),
+            )
+        else:
+            item = self._forced_response_from_payload(
+                forced,
+                prompt_fingerprint=prompt_fingerprint,
+                source=source,
+                metadata=metadata,
+            )
+        self.forced_responses.append(item)
+
+    def consume_forced_response(self, request: Request) -> ForcedResponse | None:
+        if not self.forced_responses:
+            return None
+        item = self.forced_responses[0]
+        if item.prompt_fingerprint is not None:
+            actual = request_fingerprint(request)
+            if actual != item.prompt_fingerprint:
+                raise TaskError(
+                    "forced response prompt fingerprint mismatch: "
+                    f"expected {item.prompt_fingerprint}, got {actual}"
+                )
+        return self.forced_responses.popleft()
+
+    def _forced_response_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        prompt_fingerprint: str | None,
+        source: str,
+        metadata: dict[str, Any] | None,
+    ) -> ForcedResponse:
+        data = dict(payload.get("response") or payload)
+        item_fingerprint = data.pop("prompt_fingerprint", None) or prompt_fingerprint
+        item_source = str(data.pop("source", None) or source)
+        item_metadata = dict(data.pop("metadata", None) or metadata or {})
+        if "message" not in data:
+            data["message"] = {
+                "role": "assistant",
+                "content": data.pop("content", ""),
+            }
+        data.setdefault("finish_reason", "stop")
+        data.setdefault("id", f"forced-{len(self.forced_responses)}")
+        data.setdefault("created", int(time.time()))
+        data.setdefault("model", self.ctx.model)
+        return ForcedResponse(
+            response=Response.model_validate(data),
+            prompt_fingerprint=str(item_fingerprint)
+            if item_fingerprint is not None
+            else None,
+            source=item_source,
+            metadata=item_metadata,
+        )
 
     async def rewrite_request(
         self, request: Request, *, run_stops: bool = True
