@@ -441,11 +441,15 @@ class AgentEnvRuntime(Runtime):
         try:
             _cmd = self._sandbox.commands.run(
                 wrapped,
-                # `env or {}` (not process_env): matches the proven shipping behavior and takes no
-                # dependency on a base method that may be absent in an older pinned verifiers when
-                # this file is injected into it. self.env is empty on the mini_swe_agent path, so
-                # this is byte-identical to process_env(env) there anyway.
-                envs=env or {},
+                # process_env, not `env or {}`: E2B's envd does NOT inherit the image's
+                # Dockerfile ENV the way `docker exec` does, so `Task.runtime_env()` values
+                # placed on `self.env` are the ONLY way a task's contract environment
+                # (e.g. PYTHONHASHSEED, SETUPTOOLS_SCM_PRETEND_VERSION for vcs-versioned
+                # editable installs) reaches a command here. Measured 2026-08-27: statsmodels
+                # import fails in-sandbox without it — the meson editable loader's ninja
+                # rebuild regenerates _version.py via setuptools_scm, which needs the
+                # pretend-version var at IMPORT time, not just at build time.
+                envs=self.process_env(env or {}),
                 user="root",
                 cwd=self.config.workdir or None,
                 timeout=self.config.exec_timeout,
