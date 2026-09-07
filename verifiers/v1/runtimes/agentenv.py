@@ -71,6 +71,11 @@ class AgentEnvConfig(BaseConfig):
     template: str | None = None
     """Explicit template alias override. None -> _slug(image) (the out-of-band-registered alias)."""
     network_access: bool = True
+    allow_out: list[str] = []
+    """Egress allowlist (domains/CIDRs, E2B `network.allow_out`). Empty = no rules —
+    plain `network_access` semantics. Non-empty = only these destinations are reachable;
+    include the interception tunnel's host and the uv/PyPI hosts the harness bootstrap
+    needs (`pypi.org`, `files.pythonhosted.org`, `astral.sh`)."""
     cpu: float = 1.0
     memory: float = 2.0
     exec_timeout: float = 0.0
@@ -188,10 +193,17 @@ class AgentEnvRuntime(Runtime):
                 flush=True,
             )
         if not base:
+            # No self-hosted plane configured: fall through to E2B CLOUD when a real
+            # API key is present. The SDK's own defaults supply the domain, so the
+            # only thing to pass is the key — everything else (template alias,
+            # network rules) is already in the create call.
+            cloud_key = os.environ.get("E2B_API_KEY", "")
+            if cloud_key:
+                return {"api_key": cloud_key}
             raise SandboxError(
-                "AgentEnvRuntime needs a self-hosted AgentENV endpoint: set CHORUS_E2B_API_URL, "
-                "AgentEnvConfig.api_url, or write the URL to /tmp/chorus-agentenv-url "
-                "(CHORUS_AGENTENV_URL_FILE)"
+                "AgentEnvRuntime needs a self-hosted AgentENV endpoint (set "
+                "CHORUS_E2B_API_URL, AgentEnvConfig.api_url, or write the URL to "
+                "/tmp/chorus-agentenv-url) or an E2B cloud key (E2B_API_KEY)"
             )
         return {
             "api_url": base,
@@ -217,6 +229,20 @@ class AgentEnvRuntime(Runtime):
                 now = time.monotonic()
             cls._last_create_monotonic = now
 
+    def _network_opts(self) -> dict:
+        """Extra create kwargs for the egress allowlist, when one is configured."""
+        if not self.config.allow_out:
+            return {}
+        # E2B requires an explicit deny-all alongside an allowlist — without it the
+        # API 400s. The sentinel is the CIDR (e2b.ALL_TRAFFIC == "0.0.0.0/0"); the
+        # literal string "ALL_TRAFFIC" the error message names is rejected.
+        return {
+            "network": {
+                "allow_out": list(self.config.allow_out),
+                "deny_out": ["0.0.0.0/0"],
+            }
+        }
+
     async def _cold_create(self, conn: dict[str, str]):
         """Create a fresh sandbox from the registered image template (the ~40s+ cold path)."""
         from e2b import AsyncSandbox
@@ -225,6 +251,7 @@ class AgentEnvRuntime(Runtime):
             template=self._template_name(),
             allow_internet_access=self.config.network_access,
             timeout=self.config.sandbox_timeout,
+            **self._network_opts(),
             **conn,
         )
 
@@ -314,6 +341,7 @@ class AgentEnvRuntime(Runtime):
                 template=snap,
                 allow_internet_access=self.config.network_access,
                 timeout=self.config.sandbox_timeout,
+                **self._network_opts(),
                 **conn,
             )
             cls.fork_hits += 1
@@ -413,11 +441,15 @@ class AgentEnvRuntime(Runtime):
         try:
             _cmd = self._sandbox.commands.run(
                 wrapped,
-                # `env or {}` (not process_env): matches the proven shipping behavior and takes no
-                # dependency on a base method that may be absent in an older pinned verifiers when
-                # this file is injected into it. self.env is empty on the mini_swe_agent path, so
-                # this is byte-identical to process_env(env) there anyway.
-                envs=env or {},
+                # process_env, not `env or {}`: E2B's envd does NOT inherit the image's
+                # Dockerfile ENV the way `docker exec` does, so `Task.runtime_env()` values
+                # placed on `self.env` are the ONLY way a task's contract environment
+                # (e.g. PYTHONHASHSEED, SETUPTOOLS_SCM_PRETEND_VERSION for vcs-versioned
+                # editable installs) reaches a command here. Measured 2026-08-27: statsmodels
+                # import fails in-sandbox without it — the meson editable loader's ninja
+                # rebuild regenerates _version.py via setuptools_scm, which needs the
+                # pretend-version var at IMPORT time, not just at build time.
+                envs=self.process_env(env or {}),
                 user="root",
                 cwd=self.config.workdir or None,
                 timeout=self.config.exec_timeout,
@@ -451,7 +483,11 @@ class AgentEnvRuntime(Runtime):
 
     async def _read(self, path: str) -> bytes:
         try:
-            return await self._sandbox.files.read(path, format="bytes", user="root")
+            # The SDK returns a bytearray; the Runtime contract says bytes — and a
+            # bytearray read back into files.write is rejected by the SDK itself.
+            return bytes(
+                await self._sandbox.files.read(path, format="bytes", user="root")
+            )
         except Exception as e:
             raise SandboxError(f"read {path!r}: {e}") from e
 
